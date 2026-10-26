@@ -303,7 +303,11 @@ class ConfidenceHead(nn.Module):
         ).float()
         near_contact = (rep_distances < 8).float()
         interface_per_token = (
-            near_contact * inter_chain * (1.0 - is_ligand).unsqueeze(-1)
+            near_contact
+            * inter_chain
+            * (1.0 - is_ligand).unsqueeze(-1)
+            * mask[:, :, None].float()
+            * mask[:, None, :].float()
         ).amax(dim=-1)
         iplddt_weight = torch.where(
             is_ligand.bool(),
@@ -1163,9 +1167,13 @@ class EsmFold2Model(HubPreTrainedModel):
                 else z
             )
             assert _z_emb is not None
-            embeddings["output_embedding_pair_pooled"] = _z_emb.detach().mean(
-                dim=1, dtype=torch.float32
-            )
+            if bool(tok_mask.all()):
+                pooled = _z_emb.detach().mean(dim=1, dtype=torch.float32)
+            else:
+                weights = tok_mask[:, :, None, None].float()
+                pooled = (_z_emb.detach().float() * weights).sum(dim=1)
+                pooled = pooled / weights.sum(dim=1).clamp(min=1)
+            embeddings["output_embedding_pair_pooled"] = pooled
             del _z_emb
 
         _cp_disto = getattr(self, "_cp_distogram_head", None)

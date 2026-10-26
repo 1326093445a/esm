@@ -1,3 +1,4 @@
+from esm.models.esmfold2.batching import collate_features, split_outputs
 from esm.models.esmfold2.config import (
     ESMFOLD2_EXPERIMENTAL_HF_REPO,
     ESMFOLD2_HF_REPO,
@@ -52,6 +53,8 @@ __all__ = [
     "RNAInput",
     "StructurePredictionInput",
     "clean_esmfold2_input",
+    "collate_features",
     "load_ccd",
     "prepare_esmfold2_input",
+    "split_outputs",
 ]

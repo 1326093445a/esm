@@ -227,6 +227,41 @@ def maybe_subsample_msa(
     depth = msa.size(1)
     if depth <= 1 or depth <= max_depth:
         return msa, msa_attention_mask, has_deletion, deletion_value
+    if msa_attention_mask is not None and not bool(msa_attention_mask.any(-1).all()):
+        # Mixed-depth batches have padded rows. Sampling from the batch maximum
+        # can discard most of a shorter MSA. Sample valid rows per design.
+        row_valid = msa_attention_mask.any(-1)
+        indices = torch.zeros(
+            (msa.shape[0], max_depth), dtype=torch.long, device=msa.device
+        )
+        selected_mask = torch.zeros_like(indices, dtype=torch.bool)
+        for b in range(msa.shape[0]):
+            candidates = row_valid[b, 1:].nonzero(as_tuple=True)[0] + 1
+            count = min(max_depth - 1, candidates.numel())
+            if count:
+                selected = candidates[
+                    torch.randperm(candidates.numel(), device=msa.device)[:count]
+                ]
+                indices[b, 1 : count + 1] = selected.sort().values
+            selected_mask[b, 0] = row_valid[b, 0]
+            selected_mask[b, 1 : count + 1] = True
+
+        def gather_rows(value: Tensor | None) -> Tensor | None:
+            if value is None:
+                return None
+            gathered = value.gather(
+                1, indices[..., None].expand(-1, -1, value.shape[2])
+            )
+            return gathered.masked_fill(~selected_mask[..., None], 0)
+
+        sampled_msa = gather_rows(msa)
+        assert sampled_msa is not None
+        return (
+            sampled_msa,
+            gather_rows(msa_attention_mask),
+            gather_rows(has_deletion),
+            gather_rows(deletion_value),
+        )
     indices = torch.zeros(max_depth, dtype=torch.long, device=msa.device)
     perm = torch.randperm(depth - 1, device=msa.device)[: max_depth - 1]
     indices[1:] = perm + 1

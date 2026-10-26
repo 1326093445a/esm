@@ -1,5 +1,6 @@
 import random
 import warnings
+from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
@@ -7,6 +8,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from esm.models.esmfold2.batching import collate_features, split_outputs
 from esm.models.esmfold2.conformers import load_ccd
 from esm.models.esmfold2.output import build_molecular_complex_from_features
 from esm.models.esmfold2.prepare_input import ChainInfo, prepare_esmfold2_input
@@ -265,6 +267,10 @@ class ESMFold2InputBuilder:
         MolecularComplexResult or list[MolecularComplexResult]
             A single result when num_diffusion_samples == 1, otherwise a list of length Bm.
         """
+        if features["atom_attention_mask"].shape[0] != 1:
+            raise ValueError(
+                "decode() accepts one design; use decode_batch() for B > 1"
+            )
         atom_mask = features["atom_attention_mask"][0]
         ref_element = features["ref_element"][0]
         ref_atom_name_chars = features["ref_atom_name_chars"][0]
@@ -276,6 +282,7 @@ class ESMFold2InputBuilder:
         ptm_t = output.get("ptm")
         iptm_t = output.get("iptm")
         pae_t = output.get("pae")
+        pde_t = output.get("pde")
         distogram_t = output.get("distogram_logits")
         pair_chains_t = output.get("pair_chains_iptm")
         residue_index_t = output.get("residue_index")
@@ -301,6 +308,7 @@ class ESMFold2InputBuilder:
                     ptm=float(ptm_t[i].item()) if ptm_t is not None else None,
                     iptm=float(iptm_t[i].item()) if iptm_t is not None else None,
                     pae=pae_t[i].detach().cpu() if pae_t is not None else None,
+                    pde=pde_t[i].detach().cpu() if pde_t is not None else None,
                     distogram=(
                         distogram_t[0].detach().cpu()
                         if distogram_t is not None
@@ -335,6 +343,119 @@ class ESMFold2InputBuilder:
         if num_diffusion_samples == 1 and len(results) == 1:
             return results[0]
         return results
+
+    def decode_batch(
+        self,
+        output: dict[str, torch.Tensor],
+        features: Sequence[dict[str, torch.Tensor]],
+        chain_infos: Sequence[list[ChainInfo]],
+        *,
+        num_diffusion_samples: int,
+        complex_ids: Sequence[str] | None = None,
+    ) -> list[list[MolecularComplexResult]]:
+        """Decode as ``results[design_index][sample_index]``, even for B=S=1.
+
+        ``features`` contains each design's original B=1 tensors, not the
+        collated batch. All samples are retained; callers select their best
+        sample within each design using the metric appropriate to their task.
+        """
+        if len(features) != len(chain_infos):
+            raise ValueError("Need one chain metadata list per design")
+        ids = (
+            list(complex_ids)
+            if complex_ids is not None
+            else [f"pred_{i}" for i in range(len(features))]
+        )
+        if len(ids) != len(features) or len(set(ids)) != len(ids):
+            raise ValueError("Need one unique complex_id per design")
+        per_design = split_outputs(
+            output, features, num_diffusion_samples=num_diffusion_samples
+        )
+        results = []
+        for prediction, item, chains, name in zip(
+            per_design, features, chain_infos, ids
+        ):
+            decoded = self.decode(
+                prediction,
+                item,
+                chains,
+                num_diffusion_samples=num_diffusion_samples,
+                complex_id=name,
+            )
+            results.append(decoded if isinstance(decoded, list) else [decoded])
+        return results
+
+    def fold_batch(
+        self,
+        model: Any,
+        inputs: Sequence[StructurePredictionInput],
+        *,
+        num_loops: int = 20,
+        num_sampling_steps: int = 200,
+        num_diffusion_samples: int = 1,
+        seed: int | None = None,
+        lm_dropout: float | None = 0.3,
+        msa_max_depth: int | None = 1024,
+        msa_column_mask_rate: float = 0.1,
+        complex_ids: Sequence[str] | None = None,
+        **forward_kwargs: Any,
+    ) -> list[list[MolecularComplexResult]]:
+        """Fold independent inputs together in one model forward on its device.
+
+        Returns ``results[design][sample]`` with padding removed from decoded
+        results. Use similarly sized inputs to limit quadratic pair padding.
+        ``seed`` seeds the whole batch: changing batch membership or padding
+        changes RNG consumption and can change predictions. This API does not
+        promise bitwise equivalence to separately seeded singleton inference.
+
+        For full-source ESMC with structural cropping, prepare each input and
+        its cropped ``lm_hidden_states`` first, use ``collate_features``, call
+        the model once, then ``split_outputs`` or ``decode_batch``.
+        """
+        if (
+            not inputs
+            or not isinstance(num_diffusion_samples, int)
+            or num_diffusion_samples < 1
+        ):
+            raise ValueError("Need at least one input and one diffusion sample")
+        if complex_ids is not None and (
+            len(complex_ids) != len(inputs) or len(set(complex_ids)) != len(inputs)
+        ):
+            raise ValueError("Need one unique complex_id per design")
+        if getattr(model, "_cp_pair_init", None) is not None:
+            raise ValueError("fold_batch() is not qualified with Fold-CP")
+        if getattr(model.config, "type", None) == "experimental":
+            raise ValueError(
+                "fold_batch() currently supports the released ESMFold2 architecture"
+            )
+        prepared = [self.prepare_input(item, seed=seed) for item in inputs]
+        features = [item[0] for item in prepared]
+        chains = [item[1] for item in prepared]
+        batch = {
+            key: value.to(model.device)
+            for key, value in collate_features(features).items()
+        }
+        with (
+            torch.no_grad(),
+            _seed_context(seed),
+            _lm_dropout_context(model, lm_dropout),
+        ):
+            output = model(
+                **batch,
+                num_loops=num_loops,
+                num_sampling_steps=num_sampling_steps,
+                num_diffusion_samples=num_diffusion_samples,
+                msa_max_depth=msa_max_depth,
+                msa_column_mask_rate=msa_column_mask_rate,
+                **forward_kwargs,
+            )
+        return self.decode_batch(
+            output,
+            features,
+            chains,
+            num_diffusion_samples=num_diffusion_samples,
+            complex_ids=complex_ids,
+        )
 
     def fold(
         self,
